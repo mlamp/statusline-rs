@@ -36,34 +36,34 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-// Color for the 5h segment: a green->red gradient driven by time-to-reset,
-// but the redness is capped by how much quota has been burned so a distant
-// reset stays calm when usage is low ("only redden when constrained").
-// Only called for p >= 50; secs is the (positive) seconds until reset.
-fn five_time_col(p: i64, secs: i64) -> &'static str {
-    // time severity: 0=green (reset near) .. 3=red (reset far)
-    let ts = if secs < 2700 {
-        0 // < 45m
-    } else if secs < 5400 {
-        1 // < 1.5h
-    } else if secs < 9000 {
-        2 // < 2.5h
+// Velocity-based color for a rate-limit meter. `used` is the 0..100 usage
+// percent; `elapsed` is the 0.0..1.0 fraction of the window that has already
+// elapsed. Below 50% usage the meter is dimmed (plenty of runway, don't
+// distract). Above that we compare the burn to the linear on-pace line:
+// `used / elapsed` projects the current pace forward to the reset. A projection
+// of ~100% means we'll reach the reset right as the cap is hit (green); the
+// further the projection overshoots 100%, the faster we're burning and the
+// warmer the color ramps, up to red.
+//
+// Note: this is deliberately pace-based, not level-based, so a high absolute
+// usage late in the window (e.g. 92% used with 95% elapsed) still reads green —
+// you paced yourself and will reset before the cap. To also warn on a high
+// absolute level regardless of pace, add an early `if used >= 90 { return … }`.
+fn velocity_col(used: i64, elapsed: f64) -> &'static str {
+    if used < 50 {
+        return "2"; // dim: idle
+    }
+    // Clamp elapsed away from 0 so a just-started window can't divide-by-~zero.
+    let e = elapsed.clamp(0.01, 1.0);
+    let ratio = used as f64 / 100.0 / e;
+    if ratio <= 1.0 {
+        "32" // green: on or under pace
+    } else if ratio <= 1.25 {
+        "33" // yellow: a bit ahead of pace
+    } else if ratio <= 1.5 {
+        "38;5;208" // orange
     } else {
-        3 // >= 2.5h
-    };
-    // usage cap: how red we're allowed to get for the current burn
-    let cap = if p >= 85 {
-        3
-    } else if p >= 70 {
-        2
-    } else {
-        1 // 50..70
-    };
-    match ts.min(cap) {
-        0 => "32",        // green
-        1 => "33",        // yellow
-        2 => "38;5;208",  // orange
-        _ => "91",        // red
+        "91" // red: burning well over pace
     }
 }
 
@@ -171,8 +171,6 @@ fn main() {
     let model_id = str_field(&get(&["model", "id"]));
     let effort = str_field(&get(&["effort", "level"]));
     let cost = num_opt(&get(&["cost", "total_cost_usd"]));
-    let ladd = num_opt(&get(&["cost", "total_lines_added"])).unwrap_or(0.0) as i64;
-    let ldel = num_opt(&get(&["cost", "total_lines_removed"])).unwrap_or(0.0) as i64;
     let h5 = num_opt(&get(&["rate_limits", "five_hour", "used_percentage"]));
     let h5rst = num_opt(&get(&["rate_limits", "five_hour", "resets_at"]));
     let wk = num_opt(&get(&["rate_limits", "seven_day", "used_percentage"]));
@@ -263,22 +261,12 @@ fn main() {
         }
     }
 
-    // --- lines ---
-    let mut lines = String::new();
-    if ladd > 0 {
-        lines.push_str(&format!("{ESC}[32m+{ladd}{ESC}[0m"));
-    }
-    if ldel > 0 {
-        if !lines.is_empty() {
-            lines.push_str(&format!("{ESC}[2m/{ESC}[0m"));
-        }
-        lines.push_str(&format!("{ESC}[31m-{ldel}{ESC}[0m"));
-    }
-
-    // --- 5h rate limit ---
-    // Always shown; a `↻` countdown to reset replaces the old wall-clock time.
-    // Dim below 50% usage (idle), otherwise colored by time-to-reset (see
-    // `five_time_col`). Falls back to the usage color when there's no reset ts.
+    // --- session (5h) rate limit ---
+    // `S:<used>%/↻<countdown>`. The percent is colored by burn velocity (see
+    // `velocity_col`); the `S:` label and `↻` countdown stay dim so the number
+    // carries the signal. Falls back to the usage color when there's no reset
+    // timestamp (can't derive elapsed without it).
+    const FIVE_HOUR: f64 = 5.0 * 3600.0;
     let mut l5 = String::new();
     if let Some(h5v) = h5 {
         let p = round0(h5v);
@@ -294,54 +282,55 @@ fn main() {
                 let h = s / 3600;
                 let m = (s % 3600) / 60;
                 if h > 0 {
-                    format!(" \u{21bb}{h}h{m}m")
+                    format!("/\u{21bb}{h}h{m}m")
                 } else {
-                    format!(" \u{21bb}{m}m")
+                    format!("/\u{21bb}{m}m")
                 }
             }
             None => String::new(),
         };
-        let col = if p < 50 {
-            "\x1b[2m".to_string()
-        } else {
-            match secs {
-                Some(s) => format!("{ESC}[{}m", five_time_col(p, s)),
-                None => format!("{ESC}[{}m", ratecol(p)),
-            }
+        let col: &str = match secs {
+            Some(s) => velocity_col(p, 1.0 - s as f64 / FIVE_HOUR),
+            None if p >= 50 => ratecol(p),
+            None => "2",
         };
-        l5 = format!("{col}5h({p}%){tpart}{ESC}[0m");
+        l5 = format!("{ESC}[2mS:{ESC}[0m{ESC}[{col}m{p}%{ESC}[0m{ESC}[2m{tpart}{ESC}[0m");
     }
 
-    // --- weekly rate limit ---
+    // --- weekly (7d) rate limit ---
+    // Same `W:<used>%/↻<countdown>` shape and velocity coloring as the session
+    // meter, over a seven-day window.
+    const SEVEN_DAY: f64 = 7.0 * 86400.0;
     let mut lwk = String::new();
     if let Some(wkv) = wk {
         let p = round0(wkv);
-        let mut cd = String::new();
+        let mut secs = None;
         if let Some(rst) = wkrst {
-            let secs = rst as i64 - now_secs();
-            if secs > 0 {
-                let d = secs / 86400;
-                let h = (secs % 86400) / 3600;
-                if d > 0 {
-                    cd = format!("\u{21bb}{d}d{h}h");
-                } else if h > 0 {
-                    cd = format!("\u{21bb}{h}h");
-                } else {
-                    cd = format!("\u{21bb}{}m", secs / 60);
-                }
+            let s = rst as i64 - now_secs();
+            if s > 0 {
+                secs = Some(s);
             }
         }
-        let wc = if p >= 50 {
-            format!("{ESC}[{}m", ratecol(p))
-        } else {
-            "\x1b[2m".to_string()
+        let cd = match secs {
+            Some(s) => {
+                let d = s / 86400;
+                let h = (s % 86400) / 3600;
+                if d > 0 {
+                    format!("/\u{21bb}{d}d{h}h")
+                } else if h > 0 {
+                    format!("/\u{21bb}{h}h")
+                } else {
+                    format!("/\u{21bb}{}m", s / 60)
+                }
+            }
+            None => String::new(),
         };
-        let cdpart = if cd.is_empty() {
-            String::new()
-        } else {
-            format!(" {cd}")
+        let col: &str = match secs {
+            Some(s) => velocity_col(p, 1.0 - s as f64 / SEVEN_DAY),
+            None if p >= 50 => ratecol(p),
+            None => "2",
         };
-        lwk = format!("{wc}Wk({p}%){cdpart}{ESC}[0m");
+        lwk = format!("{ESC}[2mW:{ESC}[0m{ESC}[{col}m{p}%{ESC}[0m{ESC}[2m{cd}{ESC}[0m");
     }
 
     // --- assemble ---
@@ -363,9 +352,6 @@ fn main() {
     }
     if !costs.is_empty() {
         out.push_str(&format!("  {costs}"));
-    }
-    if !lines.is_empty() {
-        out.push_str(&format!("  {lines}"));
     }
     if !l5.is_empty() {
         out.push_str(&format!("  {l5}"));

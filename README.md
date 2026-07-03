@@ -15,13 +15,13 @@ frequently.
 ## Example
 
 ```text
-statusline-rs   main (+6)  sonnet-5md  ctx:88%  $0.42  +57/-12
+statusline-rs   main (+6)  sonnet-5md  ctx:88%  $0.42
 ```
 
 A busier session, with a pull request, both rate-limit meters, and vim mode:
 
 ```text
-acme/src  #128  opus-4-8[1m]hi  ctx:62%  $1.37  +214/-38  5h(72%) ↻1h34m  Wk(41%) ↻2d3h  NORMAL
+acme/src  #128  opus-4-8[1m]hi  ctx:62%  $1.37  S:72%/↻1h34m  W:41%/↻2d3h  NORMAL
 ```
 
 (In a real terminal every segment is colored; the PR number is an OSC 8 hyperlink
@@ -41,9 +41,8 @@ present, so the line stays short in simple sessions.
 | **Model** | `opus-4-8[1m]hi` | `model.id` with the `claude-` prefix dropped, plus an effort suffix: `lo` / `md` / `hi` / `xh` / `max`. |
 | **Context** | `ctx:62%` | Remaining context window. Green > 70%, yellow > 40%, orange > 20%, red at or below 20%. |
 | **Cost** | `$1.37` | Total session cost in USD (hidden below ~half a cent). |
-| **Lines** | `+214/-38` | Lines added / removed this session. |
-| **5-hour limit** | `5h(72%) ↻1h34m` | Always shown; `↻` counts down to reset (`↻34m` under an hour). Dim under 50% usage; above that, colored by time-to-reset — green when reset is near, ramping to red only when it's far *and* you've burned a lot (50–70% caps at yellow, 70–85% at orange, ≥85% can go red; anything ≥2.5h out is red). |
-| **Weekly limit** | `Wk(41%) ↻2d3h` | Weekly usage with a `↻` countdown to reset. Dim under 50%, then the usage color ramp (yellow → orange → red). |
+| **Session limit (5h)** | `S:72%/↻1h34m` | `S:` = 5-hour usage; `↻` counts down to reset (`↻34m` under an hour). Dim under 50% usage. Above that, colored by **burn velocity** — usage compared to how far through the 5-hour window you are: green when on or under pace, ramping yellow → orange → red the faster you're projected to overshoot the cap before reset. So a high absolute usage late in the window can still read green if you paced yourself. |
+| **Weekly limit (7d)** | `W:41%/↻2d3h` | Same `↻` countdown and velocity coloring as the session meter, over a 7-day window. |
 | **Vim mode** | `NORMAL` | Green in `INSERT`, blue otherwise. Shown only when vim mode is active. |
 
 ## Install
@@ -106,7 +105,7 @@ following fields (all optional — anything missing just omits that segment):
   "model":          { "id": "claude-…" },
   "effort":         { "level": "low|medium|high|xhigh|max" },
   "context_window": { "remaining_percentage": 62.4 },
-  "cost":           { "total_cost_usd": 1.37, "total_lines_added": 214, "total_lines_removed": 38 },
+  "cost":           { "total_cost_usd": 1.37 },
   "rate_limits": {
     "five_hour": { "used_percentage": 72, "resets_at": 1751558400 },
     "seven_day": { "used_percentage": 41, "resets_at": 1752000000 }
@@ -129,7 +128,7 @@ The rendering is a single, readable `src/main.rs` (~350 lines, no macros or conf
 layer). Colors, thresholds, glyphs, and which segments appear are all plain code —
 edit the relevant block and rebuild. A few starting points:
 
-- Color thresholds live in `ratecol` (rate limits) and the `ctx` block (context).
+- Color thresholds live in `velocity_col` and `ratecol` (rate limits) and the `ctx` block (context).
 - Segment order and spacing are assembled at the bottom of `main`.
 - The directory-shortening rules are in the `dir` block near the top of `main`.
 
