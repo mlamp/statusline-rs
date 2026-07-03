@@ -21,7 +21,7 @@ statusline-rs   main (+6)  sonnet-5md  ctx:88%  $0.42  +57/-12
 A busier session, with a pull request, both rate-limit meters, and vim mode:
 
 ```text
-acme/src  #128  opus-4-8[1m]hi  ctx:62%  $1.37  +214/-38  5h(72%) ↻19:00  Wk(41%)  NORMAL
+acme/src  #128  opus-4-8[1m]hi  ctx:62%  $1.37  +214/-38  5h(72%) ↻1h34m  Wk(41%) ↻2d3h  NORMAL
 ```
 
 (In a real terminal every segment is colored; the PR number is an OSC 8 hyperlink
@@ -42,8 +42,8 @@ present, so the line stays short in simple sessions.
 | **Context** | `ctx:62%` | Remaining context window. Green > 70%, yellow > 40%, orange > 20%, red at or below 20%. |
 | **Cost** | `$1.37` | Total session cost in USD (hidden below ~half a cent). |
 | **Lines** | `+214/-38` | Lines added / removed this session. |
-| **5-hour limit** | `5h(72%) ↻19:00` | Shown once usage reaches 50%. Color ramps yellow → orange → red as it climbs; `↻` marks the reset time. |
-| **Weekly limit** | `Wk(41%) -2d3h` | Weekly usage with a countdown to reset. Dim under 50%, then the same color ramp. |
+| **5-hour limit** | `5h(72%) ↻1h34m` | Always shown; `↻` counts down to reset (`↻34m` under an hour). Dim under 50% usage; above that, colored by time-to-reset — green when reset is near, ramping to red only when it's far *and* you've burned a lot (50–70% caps at yellow, 70–85% at orange, ≥85% can go red; anything ≥2.5h out is red). |
+| **Weekly limit** | `Wk(41%) ↻2d3h` | Weekly usage with a `↻` countdown to reset. Dim under 50%, then the usage color ramp (yellow → orange → red). |
 | **Vim mode** | `NORMAL` | Green in `INSERT`, blue otherwise. Shown only when vim mode is active. |
 
 ## Install

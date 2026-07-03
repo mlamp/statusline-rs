@@ -16,18 +16,6 @@ fn round0(v: f64) -> i64 {
     format!("{:.0}", v).parse::<i64>().unwrap_or(0)
 }
 
-// Local time HH:MM, matching `date -r <ts> +%H:%M`.
-fn hhmm(ts: i64) -> String {
-    unsafe {
-        let t = ts as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            return String::new();
-        }
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
-}
-
 fn ratecol(p: i64) -> &'static str {
     if p >= 95 {
         "1;31"
@@ -37,6 +25,45 @@ fn ratecol(p: i64) -> &'static str {
         "38;5;208"
     } else {
         "33"
+    }
+}
+
+// Current wall-clock time as unix seconds (0 on failure).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// Color for the 5h segment: a green->red gradient driven by time-to-reset,
+// but the redness is capped by how much quota has been burned so a distant
+// reset stays calm when usage is low ("only redden when constrained").
+// Only called for p >= 50; secs is the (positive) seconds until reset.
+fn five_time_col(p: i64, secs: i64) -> &'static str {
+    // time severity: 0=green (reset near) .. 3=red (reset far)
+    let ts = if secs < 2700 {
+        0 // < 45m
+    } else if secs < 5400 {
+        1 // < 1.5h
+    } else if secs < 9000 {
+        2 // < 2.5h
+    } else {
+        3 // >= 2.5h
+    };
+    // usage cap: how red we're allowed to get for the current burn
+    let cap = if p >= 85 {
+        3
+    } else if p >= 70 {
+        2
+    } else {
+        1 // 50..70
+    };
+    match ts.min(cap) {
+        0 => "32",        // green
+        1 => "33",        // yellow
+        2 => "38;5;208",  // orange
+        _ => "91",        // red
     }
 }
 
@@ -249,21 +276,40 @@ fn main() {
     }
 
     // --- 5h rate limit ---
+    // Always shown; a `↻` countdown to reset replaces the old wall-clock time.
+    // Dim below 50% usage (idle), otherwise colored by time-to-reset (see
+    // `five_time_col`). Falls back to the usage color when there's no reset ts.
     let mut l5 = String::new();
     if let Some(h5v) = h5 {
         let p = round0(h5v);
-        if p >= 50 {
-            let mut t = String::new();
-            if let Some(rst) = h5rst {
-                t = hhmm(rst as i64);
+        let mut secs = None;
+        if let Some(rst) = h5rst {
+            let s = rst as i64 - now_secs();
+            if s > 0 {
+                secs = Some(s);
             }
-            let tpart = if t.is_empty() {
-                String::new()
-            } else {
-                format!(" \u{21bb}{t}")
-            };
-            l5 = format!("{ESC}[{}m5h({p}%){tpart}{ESC}[0m", ratecol(p));
         }
+        let tpart = match secs {
+            Some(s) => {
+                let h = s / 3600;
+                let m = (s % 3600) / 60;
+                if h > 0 {
+                    format!(" \u{21bb}{h}h{m}m")
+                } else {
+                    format!(" \u{21bb}{m}m")
+                }
+            }
+            None => String::new(),
+        };
+        let col = if p < 50 {
+            "\x1b[2m".to_string()
+        } else {
+            match secs {
+                Some(s) => format!("{ESC}[{}m", five_time_col(p, s)),
+                None => format!("{ESC}[{}m", ratecol(p)),
+            }
+        };
+        l5 = format!("{col}5h({p}%){tpart}{ESC}[0m");
     }
 
     // --- weekly rate limit ---
@@ -272,20 +318,16 @@ fn main() {
         let p = round0(wkv);
         let mut cd = String::new();
         if let Some(rst) = wkrst {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let secs = rst as i64 - now;
+            let secs = rst as i64 - now_secs();
             if secs > 0 {
                 let d = secs / 86400;
                 let h = (secs % 86400) / 3600;
                 if d > 0 {
-                    cd = format!("-{d}d{h}h");
+                    cd = format!("\u{21bb}{d}d{h}h");
                 } else if h > 0 {
-                    cd = format!("-{h}h");
+                    cd = format!("\u{21bb}{h}h");
                 } else {
-                    cd = format!("-{}m", secs / 60);
+                    cd = format!("\u{21bb}{}m", secs / 60);
                 }
             }
         }

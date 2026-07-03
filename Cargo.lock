@@ -1631,7 +1631,6 @@ name = "sl"
 version = "0.1.0"
 dependencies = [
  "gix",
- "libc",
  "serde_json",
 ]
 
