@@ -46,26 +46,35 @@ present, so the line stays short in simple sessions.
 | **Weekly limit** | `Wk(41%) -2d3h` | Weekly usage with a countdown to reset. Dim under 50%, then the same color ramp. |
 | **Vim mode** | `NORMAL` | Green in `INSERT`, blue otherwise. Shown only when vim mode is active. |
 
-## Build
-
-Requires a recent stable [Rust toolchain](https://rustup.rs/).
-
-```sh
-cargo build --release
-```
-
-The binary is written to `target/release/sl`.
-
 ## Install
 
-Point Claude Code's status line at the binary. Copy it somewhere on your `PATH`
-(or reference it in place):
+Both methods need a recent stable [Rust toolchain](https://rustup.rs/).
+
+### With `cargo install` (quickest)
+
+Builds and installs the `sl` binary straight to `~/.cargo/bin` (make sure that's
+on your `PATH`):
 
 ```sh
-cp target/release/sl ~/.local/bin/sl
+cargo install --git https://github.com/mlamp/statusline-rs
 ```
 
-Then add this to your Claude Code settings (`~/.claude/settings.json`):
+### From source
+
+Handy if you want to hack on it or build in place:
+
+```sh
+git clone https://github.com/mlamp/statusline-rs
+cd statusline-rs
+cargo build --release
+cp target/release/sl ~/.local/bin/sl   # or anywhere on your PATH
+```
+
+The release binary lands at `target/release/sl`.
+
+### Wire it into Claude Code
+
+Add this to your Claude Code settings (`~/.claude/settings.json`):
 
 ```json
 {
@@ -76,7 +85,7 @@ Then add this to your Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
-Use an absolute path (e.g. `~/path/to/statusline-rs/target/release/sl`) if the
+Use an absolute path (e.g. `/path/to/statusline-rs/target/release/sl`) if the
 binary isn't on the `PATH` Claude Code sees.
 
 ## Requirements
