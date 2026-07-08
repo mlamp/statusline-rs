@@ -272,7 +272,9 @@ no break.
 ### Variables
 
 `c_`-prefixed variables arrive **already colored** — drop them in bare (e.g.
-`(c_ctx)`). The plain variants are raw text you color yourself.
+`(c_ctx)`). The plain variants are raw text you color yourself. Beyond these
+built-ins you can define your own, sourced from a file, with
+[a variables config](#reusable--a-variables-config-file).
 
 **Directory & workspace**
 
@@ -517,33 +519,49 @@ template variable that gates and styles like the built-ins:
 ```jsonc
 {
   "vars": [
-    { "name": "note",   "file": "~/.claude/sl-note.txt" },                      // plain file
-    { "name": "ci",     "file": "~/.claude/ctx.json", "path": ".ci.status" },   // jq-from-JSON
-    { "name": "ticket", "env": "JIRA_TICKET", "max": 12 },                      // env var, clipped to 12 chars
-    { "name": "state",  "file": "~/mytool/${session_id}.json", "path": ".status", // per-session file
-      "map": { "done": "✓", "failed": "✗" }, "default": "●" }                   // rewrite value -> symbol
+    { "name": "note", "file": "~/.claude/sl-note.txt" },                        // plain file
+    { "name": "build", "file": "~/.cache/acme/ci-status.json", "path": ".state", // CI status -> symbol
+      "map": { "passing": "✓", "failing": "✗", "running": "…" }, "default": "?" },
+    { "name": "buildmsg", "file": "~/.cache/acme/ci-status.json", "path": ".summary", "max": 48 },
+    { "name": "ticket", "env": "JIRA_TICKET", "max": 12 }                        // env var, clipped
   ]
 }
 ```
 
-Then reference them by name:
+Then reference them by name — each in its own group so it collapses when there's
+no data:
 
 ```sh
-sl --format "cyan(dir)(  dim('note:')+note)(  magenta(ci))(  blue(ticket))(  state)"
+sl --format "cyan(dir)(  dim('ci ')+build)(  dim(buildmsg))(  blue(ticket))"
 ```
 
 Each entry needs a `name` (a valid identifier) and one source:
 
 - **`file`** — the file's contents, optionally with **`path`** for jq-from-JSON
-  extraction. The path may interpolate built-in variables as **`${name}`** (e.g.
-  `~/mytool/${session_id}.json`), so a config variable can be keyed by the session.
+  extraction (`.a.b`, `.items[0].name`; leading `.` optional). The path may
+  interpolate any **top-level field of the status payload** — or any built-in
+  variable — as **`${field}`** (e.g. `${session_id}`, `${version}`,
+  `~/mytool/${session_id}.json`), so a variable can be keyed by the session.
 - **`env`** — an environment variable.
 
-Optional per-entry modifiers: **`max`** clips the value with an ellipsis, and
-**`map`** (with an optional **`default`**) rewrites a non-empty value through a
-lookup table — a conditional-free way to turn e.g. a status string into a symbol.
-A source that's missing or empty leaves the variable undefined, so its segment
-collapses — and a config name can never shadow a built-in variable.
+Optional per-entry modifiers:
+
+- **`max`** — clips the value to that many characters with a trailing `…`.
+- **`map`** — a value → display lookup, a conditional-free way to turn e.g. a
+  status string into a symbol. A value not in the table falls back to `default`.
+- **`default`** — a fallback applied **only once the file has been read**: with a
+  `map`, for an unmapped value; without one, for an empty/missing value.
+
+The read-then-default rule is what keeps the line honest: when the file is
+**absent** (missing, unreadable, or invalid JSON) the variable stays *undefined*
+and its group collapses — you never see a lone `default` on an otherwise empty
+line. A `default` shows only when the file exists but the value is missing/empty.
+
+Resolution is **lazy and cached**: a file is read only when the active template
+references that variable, and each file is read once per invocation even when
+several variables share it. A config name can never shadow a built-in variable
+(it's ignored with a warning); a missing config is silently skipped, a malformed
+one warns once on stderr and is skipped.
 
 ### Getting a string *from Claude* onto the status line
 
