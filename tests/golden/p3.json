@@ -1,0 +1,1 @@
+{"workspace":{"current_dir":"/tmp/acme"},"model":{"id":"claude-opus-4-8[1m]"},"effort":{"level":"xhigh"},"context_window":{"remaining_percentage":40},"cost":{"total_cost_usd":8.08},"rate_limits":{"five_hour":{"used_percentage":72},"seven_day":{"used_percentage":41}},"vim":{"mode":"NORMAL"}}

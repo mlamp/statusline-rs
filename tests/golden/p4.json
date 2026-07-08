@@ -1,0 +1,1 @@
+{"workspace":{"current_dir":"/tmp/acme"},"model":{"id":"claude-sonnet-5"},"context_window":{"remaining_percentage":30},"cost":{"total_cost_usd":2.5},"pr":{"number":"128","url":"https://github.com/x/y/pull/128","review_state":"approved"}}

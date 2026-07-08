@@ -344,8 +344,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Absolute path to the golden-master fixtures (git-less, resets_at-less).
-    const GOLDEN_DIR: &str = "/private/tmp/claude-501/-Users-margus--DEV--RUST-statusline-rs/6bbf2963-a234-48a3-a610-0276f66cc9ee/scratchpad/golden";
+    // Golden-master fixtures (git-less, resets_at-less), vendored under the
+    // crate. Resolved via CARGO_MANIFEST_DIR so the tests are portable — no
+    // machine-specific absolute path.
+    const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
 
     // A HOME that never prefixes the `/tmp/...` fixture paths, so `dir` never
     // collapses to `~` in the golden test.
