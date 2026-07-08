@@ -67,7 +67,8 @@ pub fn preset_names() -> Vec<&'static str> {
 /// text. Kept in sync with the keys [`build_vars`] / `insert_git_vars` emit.
 pub const VAR_NAMES: &[&str] = &[
     "current_dir", "project_dir", "dir", "worktree",
-    "model", "model_full", "effort", "effort_full",
+    "session_id", "session_name",
+    "model", "model_full", "model_name", "effort", "effort_full",
     "ctx", "c_ctx", "ctx_raw",
     "cost", "cost_raw",
     "session_pct", "c_session_pct", "session_raw", "session_secs", "session_reset_in",
@@ -118,8 +119,14 @@ pub fn build_vars(
     let cwd = crate::str_field(&get(&["workspace", "current_dir"]));
     let proj = crate::str_field(&get(&["workspace", "project_dir"]));
     let model_id = crate::str_field(&get(&["model", "id"]));
+    let model_name = crate::str_field(&get(&["model", "display_name"]));
     let effort = crate::str_field(&get(&["effort", "level"]));
     let vim = crate::str_field(&get(&["vim", "mode"]));
+    // Per-session identifiers straight from the payload — handy as raw text and,
+    // notably, to key an external per-session file (e.g. a template that reads
+    // `~/.dir/` + session_id + `.json`).
+    let session_id = crate::str_field(&get(&["session_id"]));
+    let session_name = crate::str_field(&get(&["session_name"]));
     // Populated for any linked git worktree (`git worktree add`), absent in the
     // main working tree — comes straight from the payload, no repo scan needed.
     let worktree = crate::str_field(&get(&["workspace", "git_worktree"]));
@@ -150,6 +157,12 @@ pub fn build_vars(
     if !worktree.is_empty() {
         v.insert("worktree".to_string(), worktree);
     }
+    if !session_id.is_empty() {
+        v.insert("session_id".to_string(), session_id);
+    }
+    if !session_name.is_empty() {
+        v.insert("session_name".to_string(), session_name);
+    }
 
     // --- dir block ---
     let dir = if cwd == home || cwd.is_empty() {
@@ -173,6 +186,11 @@ pub fn build_vars(
         if !base.is_empty() {
             v.insert("model".to_string(), base.to_string());
         }
+    }
+    // Human-friendly model name from the payload (e.g. "Opus 4.8"), distinct from
+    // the id-derived `model`/`model_full`.
+    if !model_name.is_empty() {
+        v.insert("model_name".to_string(), model_name);
     }
     if !effort.is_empty() {
         v.insert("effort_full".to_string(), effort.clone());

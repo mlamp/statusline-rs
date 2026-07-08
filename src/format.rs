@@ -23,6 +23,11 @@
 //!   `br`/`sgr`/`hex` builtin; any other `name(` is literal text plus a group.
 //!   Call arguments are separated by `,` (whitespace-insensitive): `sgr('1;32',
 //!   branch)`, `hex('#5f8700', x)`.
+//! - `file('path')` and `json('path', '.jq.path')` are value-producing builtins:
+//!   they substitute the contents of an external file (first line, trimmed) or a
+//!   jq-like scalar extracted from a JSON file. Their args are string literals.
+//!   They gate their group like a variable — an empty/missing source collapses
+//!   the segment. See [`crate::extvars`] for the shared reader and path syntax.
 //! - `a+b` (inside a group or call) is a concatenation join. It swallows the
 //!   whitespace on both sides, so `'ctx: '+v` and `'ctx: ' + v` are identical and
 //!   both tight. A literal `+`/`,` in a group/call is quoted (`'+'`) or escaped
@@ -73,6 +78,20 @@ enum Node {
     /// The `br(…)` builtin: emits an unstyled `\n`, then its children under the
     /// enclosing style.
     Br(Vec<Node>),
+    /// The `file(pathExpr)` builtin: substitutes the file's contents (first line,
+    /// trimmed). `pathExpr` is a node sequence evaluated to a plain string at
+    /// render, so it can interpolate variables (`'~/d/' + session_id + '.json'`).
+    /// Resolved to a synthetic `Var` by [`rewrite_files`] before flatten, so it
+    /// gates its group like any variable.
+    File(Vec<Node>),
+    /// The `json(pathExpr, jqExpr)` builtin: substitutes a scalar extracted from
+    /// a JSON file by a jq-like dotted/indexed path. Both args are node sequences
+    /// (variables interpolate). Resolved like [`Node::File`].
+    Json(Vec<Node>, Vec<Node>),
+    /// Parser-internal argument separator (a top-level `,` inside a call body).
+    /// Consumed by the call builders (split for `file`/`json`, stripped for the
+    /// rest); never present in a built AST, so render-time passes ignore it.
+    ArgSep,
 }
 
 /// A flattened text run carrying the ordered active SGR codes (outermost first).
@@ -116,10 +135,11 @@ fn is_defined(name: &str, vars: &HashMap<String, String>) -> bool {
 }
 
 /// True if `name` immediately followed by `(` should parse as a style/builtin
-/// call: a named style, or one of the `br` / `sgr` / `hex` builtins. Any other
-/// identifier before `(` is plain text and the `(` opens a group.
+/// call: a named style, or one of the `br` / `sgr` / `hex` / `file` / `json`
+/// builtins. Any other identifier before `(` is plain text and the `(` opens a
+/// group.
 fn is_call_name(name: &str) -> bool {
-    matches!(name, "br" | "sgr" | "hex") || style_code(name).is_some()
+    matches!(name, "br" | "sgr" | "hex" | "file" | "json") || style_code(name).is_some()
 }
 
 /// Preprocess the raw template BEFORE parsing (v1 §1), tracking `"…"` strings so
@@ -233,6 +253,61 @@ fn build_hex(mut inner: Vec<Node>) -> Result<Node, ParseError> {
     Ok(Node::Call(format!("38;2;{r};{g};{b}"), content))
 }
 
+/// Drop `ArgSep` markers, flattening a call body into a single content sequence
+/// (used by every builtin except `file`/`json` — for them a comma is just a
+/// readability separator, exactly like the old "comma == space" behavior).
+fn strip_argsep(inner: Vec<Node>) -> Vec<Node> {
+    inner
+        .into_iter()
+        .filter(|n| !matches!(n, Node::ArgSep))
+        .collect()
+}
+
+/// Split a call body into argument groups on top-level `ArgSep` markers. Empty
+/// input yields no arguments; a trailing separator yields a trailing empty arg.
+fn split_args(inner: Vec<Node>) -> Vec<Vec<Node>> {
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<Vec<Node>> = vec![Vec::new()];
+    for n in inner {
+        if matches!(n, Node::ArgSep) {
+            args.push(Vec::new());
+        } else {
+            args.last_mut().unwrap().push(n);
+        }
+    }
+    args
+}
+
+/// Build a `file(pathExpr)` builtin. Exactly one (non-empty) argument, a path
+/// expression evaluated to a string at render (may interpolate variables).
+fn build_file(inner: Vec<Node>) -> Result<Node, ParseError> {
+    let mut args = split_args(inner);
+    match args.len() {
+        1 if !args[0].is_empty() => Ok(Node::File(args.remove(0))),
+        0 => Err(ParseError::new("file: missing path")),
+        1 => Err(ParseError::new("file: empty path")),
+        _ => Err(ParseError::new("file: takes a single path argument")),
+    }
+}
+
+/// Build a `json(pathExpr, jqExpr)` builtin. One or two arguments: a (non-empty)
+/// path expression and an optional jq-like dotted/indexed path (default: the
+/// whole document). Both are evaluated to strings at render.
+fn build_json(inner: Vec<Node>) -> Result<Node, ParseError> {
+    let mut args = split_args(inner);
+    match args.len() {
+        1 if !args[0].is_empty() => Ok(Node::Json(args.remove(0), Vec::new())),
+        2 if !args[0].is_empty() => {
+            let jq = args.remove(1);
+            Ok(Node::Json(args.remove(0), jq))
+        }
+        0 | 1 => Err(ParseError::new("json: expects (path[, jq-path])")),
+        _ => Err(ParseError::new("json: takes path and optional jq-path")),
+    }
+}
+
 /// Parse a sequence of nodes until end-of-input or a closing `)`.
 ///
 /// On entry `*pos` points at the first char to consider. A `)` returns control
@@ -321,12 +396,14 @@ fn parse_seq(
                 }
                 *pos += 1; // consume ')'
                 let node = match ident.as_str() {
-                    "br" => Node::Br(inner),
-                    "sgr" => build_sgr(inner)?,
-                    "hex" => build_hex(inner)?,
+                    "br" => Node::Br(strip_argsep(inner)),
+                    "sgr" => build_sgr(strip_argsep(inner))?,
+                    "hex" => build_hex(strip_argsep(inner))?,
+                    "file" => build_file(inner)?,
+                    "json" => build_json(inner)?,
                     _ => Node::Call(
                         style_code(&ident).expect("is_call_name checked").to_string(),
-                        inner,
+                        strip_argsep(inner),
                     ),
                 };
                 nodes.push(node);
@@ -339,16 +416,25 @@ fn parse_seq(
                 // variable is plain text. A trailing '(' (non-call) opens a group next.
                 nodes.push(Node::Literal(ident));
             }
-        } else if (c == '+' && subst) || (c == ',' && in_call) {
-            // Structural join / argument separator: emits nothing and swallows the
-            // whitespace on BOTH sides, so `a + b` renders exactly like `a+b`. `+`
-            // joins operands anywhere inside a group or call; `,` separates
-            // arguments inside a call. A literal `+`/`,` is quoted or `\+` / `\,`;
-            // at top level (and `,` outside a call) they are ordinary literal text.
+        } else if c == '+' && subst {
+            // Structural join: emits nothing and swallows the whitespace on BOTH
+            // sides, so `a + b` renders exactly like `a+b`. Joins operands anywhere
+            // inside a group or call. A literal `+` is quoted or `\+`; at top level
+            // it is ordinary literal text.
             *pos += 1;
             while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t') {
                 *pos += 1;
             }
+        } else if c == ',' && in_call {
+            // Argument separator inside a call: swallows surrounding whitespace and
+            // emits an `ArgSep` marker so multi-node args can be split (`file`/
+            // `json`); other builtins strip it, matching the old "comma == space"
+            // behavior. A literal `,` is quoted or `\,`; outside a call it is text.
+            *pos += 1;
+            while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t') {
+                *pos += 1;
+            }
+            nodes.push(Node::ArgSep);
         } else {
             // Literal run: chars that are not ident-start / '(' / ')' / quote, nor a
             // structural `+` (in a group/call) or `,` (in a call). STRICT escapes.
@@ -420,7 +506,9 @@ fn scan_vars(nodes: &[Node], vars: &HashMap<String, String>) -> (bool, bool) {
                 has |= h;
                 any_defined |= d;
             }
-            Node::Literal(_) => {}
+            // File/Json are resolved to synthetic `Var`s before flatten, so they
+            // never reach this gating scan; ArgSep never survives a builder.
+            Node::Literal(_) | Node::File(_) | Node::Json(_, _) | Node::ArgSep => {}
         }
     }
     (has, any_defined)
@@ -477,6 +565,10 @@ fn flatten(
                 });
                 flatten(children, active, vars, out);
             }
+            // File/Json are rewritten to `Var` by `rewrite_files` before flatten
+            // runs, so these arms are unreachable in practice; emit nothing (never
+            // panic — the status line must always render). ArgSep never survives.
+            Node::File(_) | Node::Json(_, _) | Node::ArgSep => {}
         }
     }
 }
@@ -518,22 +610,117 @@ fn serialize(runs: &[Run]) -> String {
     out
 }
 
+/// Evaluate a node sequence to a plain (unstyled) string against `vars` — used
+/// for `file()`/`json()` path and jq arguments. Literals pass through, variables
+/// substitute their value (empty when undefined), and groups/calls/`br` recurse
+/// with their styling ignored (a path is text, not display). Nested file()/json()
+/// and separators contribute nothing.
+fn eval_plain(nodes: &[Node], vars: &HashMap<String, String>) -> String {
+    let mut s = String::new();
+    for n in nodes {
+        match n {
+            Node::Literal(t) => s.push_str(t),
+            Node::Var(name) => s.push_str(vars.get(name).map(String::as_str).unwrap_or("")),
+            Node::Group(inner) | Node::Call(_, inner) | Node::Br(inner) => {
+                s.push_str(&eval_plain(inner, vars))
+            }
+            Node::File(_) | Node::Json(_, _) | Node::ArgSep => {}
+        }
+    }
+    s
+}
+
+/// Resolve every `file(…)` / `json(…)` node to a synthetic `Var`, evaluating its
+/// path (and jq) expression against `vars`, reading the source once, and
+/// inserting the value into `vars` (only when non-empty, so an empty/missing
+/// source stays "undefined" and its group collapses). A path that evaluates to
+/// empty (e.g. an undefined interpolated variable) is never read. The synthetic
+/// key carries a `\0` — impossible in a template identifier — so it can never
+/// collide with a real or external variable. `home` expands a leading `~` in
+/// paths. Recurses through groups/calls/`br`.
+fn rewrite_files(
+    nodes: Vec<Node>,
+    home: &str,
+    vars: &mut HashMap<String, String>,
+    counter: &mut usize,
+) -> Vec<Node> {
+    nodes
+        .into_iter()
+        .map(|node| {
+            let resolve = |val: String, vars: &mut HashMap<String, String>, counter: &mut usize| {
+                let key = format!("\u{0}f{}", *counter);
+                *counter += 1;
+                if !val.is_empty() {
+                    vars.insert(key.clone(), val);
+                }
+                Node::Var(key)
+            };
+            match node {
+                Node::File(path) => {
+                    let p = eval_plain(&path, vars);
+                    let val = if p.trim().is_empty() {
+                        String::new()
+                    } else {
+                        crate::extvars::read_source(&p, None, home)
+                    };
+                    resolve(val, vars, counter)
+                }
+                Node::Json(path, jq) => {
+                    let p = eval_plain(&path, vars);
+                    let val = if p.trim().is_empty() {
+                        String::new()
+                    } else {
+                        crate::extvars::read_source(&p, Some(&eval_plain(&jq, vars)), home)
+                    };
+                    resolve(val, vars, counter)
+                }
+                Node::Group(c) => Node::Group(rewrite_files(c, home, vars, counter)),
+                Node::Call(code, c) => Node::Call(code, rewrite_files(c, home, vars, counter)),
+                Node::Br(c) => Node::Br(rewrite_files(c, home, vars, counter)),
+                other => other, // Literal, Var, ArgSep (ArgSep never reaches here)
+            }
+        })
+        .collect()
+}
+
 /// Render `template` against `vars`, returning the rendered status-line string
 /// or a [`ParseError`]. `registry` is the set of known variable names — inside a
 /// group or call, an identifier in `registry` substitutes its value (and gates
 /// its group when undefined); any other identifier is literal text. Never panics
-/// on well-formed UTF-8 input.
+/// on well-formed UTF-8 input. `file()`/`json()` builtins resolve against
+/// absolute paths only (no `~` expansion); use [`render_home`] to expand `~`.
+///
+/// Thin `home`-less wrapper over [`render_home`], kept as the stable entry point
+/// for tests and external callers.
+#[allow(dead_code)]
 pub fn render(
     template: &str,
     vars: &HashMap<String, String>,
     registry: &HashSet<String>,
 ) -> Result<String, ParseError> {
+    render_home(template, vars, registry, "")
+}
+
+/// Like [`render`], but `home` expands a leading `~` in `file()`/`json()` paths.
+/// This is the entry point `main` uses so external files can be referenced as
+/// `~/.claude/…`.
+pub fn render_home(
+    template: &str,
+    vars: &HashMap<String, String>,
+    registry: &HashSet<String>,
+    home: &str,
+) -> Result<String, ParseError> {
     let pre = preprocess(template);
     let chars: Vec<char> = pre.chars().collect();
     let mut pos = 0;
     let nodes = parse_seq(&chars, &mut pos, true, false, false, registry)?;
+    // Resolve file()/json() into synthetic vars in a private copy of the map so
+    // the caller's map is untouched and gating works via the existing machinery.
+    let mut vars = vars.clone();
+    let mut counter = 0;
+    let nodes = rewrite_files(nodes, home, &mut vars, &mut counter);
     let mut runs = Vec::new();
-    flatten(&nodes, &[], vars, &mut runs);
+    flatten(&nodes, &[], &vars, &mut runs);
     Ok(serialize(&runs))
 }
 
@@ -548,7 +735,14 @@ fn collect_vars(nodes: &[Node], set: &mut std::collections::BTreeSet<String>) {
             Node::Group(inner) | Node::Call(_, inner) | Node::Br(inner) => {
                 collect_vars(inner, set)
             }
-            Node::Literal(_) => {}
+            // A variable used inside a file()/json() path expression IS a real
+            // reference (so e.g. `file('/r/'+branch)` still triggers the git scan).
+            Node::File(path) => collect_vars(path, set),
+            Node::Json(path, jq) => {
+                collect_vars(path, set);
+                collect_vars(jq, set);
+            }
+            Node::Literal(_) | Node::ArgSep => {}
         }
     }
 }
@@ -1775,5 +1969,146 @@ mod tests {
             "\\e[1;32m main\\e[0m"
         );
         assert_eq!(r("(sgr('1;32', ' '+branch)( c_git))", &[]), "");
+    }
+
+    // ================= file() / json() inline builtins =================
+    // These read real files, so they use a per-test temp path and `render_home`.
+
+    /// Write `content` to a uniquely-named temp file and return its path.
+    fn tmp_write(tag: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!("sl_fmt_{tag}.tmp"));
+        std::fs::write(&path, content).expect("write temp file");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Render `t` with an empty var map (only file()/json() supply content) and
+    /// no `~` expansion, returning visible form; panics on a parse error.
+    fn rf(t: &str) -> String {
+        esc(&render(t, &HashMap::new(), &test_reg()).unwrap())
+    }
+
+    #[test]
+    fn file_substitutes_first_line_trimmed() {
+        let p = tmp_write("first_line", "  deploying  \nsecond line\n");
+        assert_eq!(rf(&format!("(file('{p}'))")), "deploying");
+    }
+
+    #[test]
+    fn file_missing_collapses_group() {
+        // A file() whose source is missing gates like an unset variable.
+        assert_eq!(rf("(dim('note:')+file('/no/such/sl/file'))"), "");
+        // ...and its label survives when paired with other content.
+        let p = tmp_write("present", "ok\n");
+        assert_eq!(
+            rf(&format!("(dim('note:')+file('{p}'))")),
+            "\\e[2mnote:\\e[0mok"
+        );
+    }
+
+    #[test]
+    fn json_extracts_nested_scalar_and_index() {
+        let p = tmp_write(
+            "json_extract",
+            r#"{"ci":{"status":"passing","checks":[{"name":"build"},{"name":"clippy"}]}}"#,
+        );
+        assert_eq!(rf(&format!("(json('{p}', '.ci.status'))")), "passing");
+        assert_eq!(rf(&format!("(json('{p}', '.ci.checks[1].name'))")), "clippy");
+    }
+
+    #[test]
+    fn json_missing_or_nonscalar_path_collapses() {
+        let p = tmp_write("json_missing", r#"{"a":{"b":1}}"#);
+        // Missing key and a non-scalar (object) both yield empty -> collapse.
+        assert_eq!(rf(&format!("(json('{p}', '.a.nope'))")), "");
+        assert_eq!(rf(&format!("(json('{p}', '.a'))")), "");
+        // A scalar renders.
+        assert_eq!(rf(&format!("(json('{p}', '.a.b'))")), "1");
+    }
+
+    #[test]
+    fn file_and_json_compose_with_styles() {
+        let p = tmp_write("compose", "on\n");
+        assert_eq!(
+            rf(&format!("(dim('CI:')+green(file('{p}')))")),
+            "\\e[2mCI:\\e[0m\\e[32mon\\e[0m"
+        );
+    }
+
+    #[test]
+    fn render_home_expands_tilde() {
+        // Point HOME at temp_dir and reference the file via `~/…`.
+        let home = std::env::temp_dir();
+        let name = "sl_fmt_tilde.tmp";
+        std::fs::write(home.join(name), "tilde-ok\n").expect("write");
+        let out = render_home(
+            &format!("(file('~/{name}'))"),
+            &HashMap::new(),
+            &test_reg(),
+            &home.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(out, "tilde-ok");
+    }
+
+    #[test]
+    fn file_json_parse_errors() {
+        // Wrong argument counts are parse errors (never a broken line; `main`
+        // falls back to DEFAULT on error).
+        assert!(is_err("(file())", &[])); // file needs a path
+        assert!(is_err("(file('/a', '/b'))", &[])); // file takes ONE arg
+        assert!(is_err("(json())", &[])); // json needs a path
+        assert!(is_err("(json('/a', '.b', '.c'))", &[])); // json takes at most two
+    }
+
+    #[test]
+    fn json_single_arg_reads_whole_scalar_document() {
+        // With no jq-path, a bare-scalar JSON document is returned as-is.
+        let p = tmp_write("json_whole", r#""just-a-string""#);
+        assert_eq!(rf(&format!("(json('{p}'))")), "just-a-string");
+    }
+
+    #[test]
+    fn file_path_interpolates_a_variable() {
+        // The core dynamic-path case: build the path from a literal + a variable
+        // (e.g. a per-session file keyed by session_id).
+        let dir = std::env::temp_dir();
+        std::fs::write(dir.join("sl_fmt_sess_ABC.tmp"), "session-driven\n").unwrap();
+        let base = format!("{}/sl_fmt_sess_", dir.to_string_lossy());
+        let out = render(
+            &format!("(file('{base}' + sid + '.tmp'))"),
+            &map(&[("sid", "ABC")]),
+            &reg(&["sid"]),
+        )
+        .unwrap();
+        assert_eq!(out, "session-driven");
+    }
+
+    #[test]
+    fn json_path_interpolates_a_variable() {
+        let dir = std::env::temp_dir();
+        std::fs::write(dir.join("sl_fmt_j_XY.tmp"), r#"{"phase":"R3"}"#).unwrap();
+        let base = format!("{}/sl_fmt_j_", dir.to_string_lossy());
+        let out = render(
+            &format!("(json('{base}' + sid + '.tmp', '.phase'))"),
+            &map(&[("sid", "XY")]),
+            &reg(&["sid"]),
+        )
+        .unwrap();
+        assert_eq!(out, "R3");
+    }
+
+    #[test]
+    fn file_bare_undefined_var_path_collapses() {
+        // file(sid) with sid undefined -> empty path -> not read -> segment gone.
+        let out = render("(dim('x')+file(sid))", &HashMap::new(), &reg(&["sid"])).unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn file_json_literal_paths_reference_no_vars() {
+        // Literal-only paths reference no variables (no git scan triggered)...
+        assert_eq!(refs("(file('/tmp/x'))(json('/tmp/y', '.a'))"), bset(&[]));
+        // ...but a variable interpolated into a path IS a real reference.
+        assert_eq!(refs("(file('/d/' + branch + '.txt'))"), bset(&["branch"]));
     }
 }

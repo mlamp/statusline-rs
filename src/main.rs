@@ -4,6 +4,9 @@ mod format;
 // Variable layer: builds the `name -> value` map from the JSON payload.
 mod vars;
 
+// External (file-backed) custom variables — jq-from-a-file / env / plain file.
+mod extvars;
+
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -386,7 +389,7 @@ fn main() {
     let tmpl = pick_template();
 
     // Registry of known variable names, shared by the reference scan and render.
-    let registry = vars::registry();
+    let mut registry = vars::registry();
 
     // Referenced vars drive the git-scan decision. On a parse error, fall back to
     // the known-good DEFAULT's references (and, below, to rendering DEFAULT).
@@ -401,10 +404,18 @@ fn main() {
         insert_git_vars(&mut varmap, &cwd);
     }
 
-    let vars_map: std::collections::HashMap<String, String> = varmap.into_iter().collect();
-    let out = match format::render(&tmpl, &vars_map, &registry) {
+    let mut vars_map: std::collections::HashMap<String, String> = varmap.into_iter().collect();
+
+    // External (file-backed) custom variables: merged after the built-ins so a
+    // stray config can never shadow a core variable. Each becomes a normal
+    // template variable, gating and styling exactly like the built-ins. `load`
+    // reads the built-in vars for `${name}` path interpolation (e.g. keying a
+    // file by session_id).
+    let ext = extvars::load(&home, &vars_map);
+    extvars::merge(ext, &mut registry, &mut vars_map, vars::VAR_NAMES);
+    let out = match format::render_home(&tmpl, &vars_map, &registry, &home) {
         Ok(s) => s,
-        Err(_) => format::render(vars::DEFAULT, &vars_map, &registry).unwrap_or_default(),
+        Err(_) => format::render_home(vars::DEFAULT, &vars_map, &registry, &home).unwrap_or_default(),
     };
 
     let stdout = std::io::stdout();

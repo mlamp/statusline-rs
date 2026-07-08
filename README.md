@@ -227,6 +227,24 @@ each optional piece in its own group so its separator collapses with it too:
 
 Calls nest and compose: `red(bold(c_ctx))` → bold red.
 
+**Value-producing builtins** pull text from *outside* Claude Code's payload.
+Unlike the style calls above they don't wrap content — they *are* content, and
+they gate their group like a variable (an empty/missing source collapses the
+segment):
+
+| Call | Effect |
+| --- | --- |
+| `file('path')` | the file's contents (first line, trimmed) — `~` expands to `$HOME` |
+| `json('path', '.a.b')` | a scalar pulled from a JSON file by a jq-like dotted/indexed path |
+
+```
+(dim('note:')+yellow(file('~/.claude/sl-note.txt')))
+(dim('CI:')+green(json('~/.claude/ctx.json', '.ci.status')))
+```
+
+See [Including data from files](#including-data-from-files) for the full story
+(including a config file for reusable named variables).
+
 **Commas** separate call arguments and ignore surrounding whitespace:
 `sgr('1;32', branch)`.
 
@@ -263,6 +281,8 @@ no break.
 | `dir` | shortened current directory (`~`, `project/dir`, `project/…/dir`, or the folder name) |
 | `current_dir` / `project_dir` | the raw absolute paths |
 | `worktree` | git worktree name when inside a linked worktree (`git worktree add`), empty in the main tree |
+| `session_id` | the session's unique id — useful to key a per-session file (see [Including data from files](#including-data-from-files)) |
+| `session_name` | the custom session name (`--name` / `/rename`), if set |
 
 **Model**
 
@@ -270,6 +290,7 @@ no break.
 | --- | --- |
 | `model` | model id without the `claude-` prefix (`opus-4-8[1m]`) |
 | `model_full` | the full model id |
+| `model_name` | the friendly display name (`Opus 4.8`) |
 | `effort` | short effort code — `lo` `md` `hi` `xh` `max` |
 | `effort_full` | the raw effort level (`xhigh`) |
 
@@ -446,6 +467,104 @@ The ramp stops and the percentage→position mapping live in `ramp_rgb` / `ctx_t
 `level_t` / `velocity_t` in `src/main.rs` (no dependencies — plain RGB
 interpolation). The `hex('#rrggbb', …)` template call always emits truecolor
 regardless of this detection.
+
+## Including data from files
+
+Claude Code's status-line payload is a **fixed schema** — there's no field you (or
+the assistant) can stuff a custom string into. To surface anything *outside* that
+payload — a deploy note, a CI status, a ticket number, whatever — the pattern is a
+**file**: some process writes it, and `sl` reads it on the next refresh. `sl` gives
+you two ways to read files, staying dependency-light (no `jq`, no subprocess).
+
+### Inline — `file()` / `json()` in a template
+
+For one-off use, read straight from the template string (see the
+[builtins table](#template-syntax)):
+
+```sh
+# a plain text file, colored, with a label; collapses when the file is empty/missing
+sl --format "cyan(dir)(  dim('note:')+yellow(file('~/.claude/sl-note.txt')))"
+
+# a value pulled from a JSON file by a jq-like path (dotted keys + [n] indices)
+sl --format "cyan(dir)(  dim('CI:')+green(json('~/.claude/ctx.json', '.ci.status')))"
+```
+
+The path language is a small subset of jq — enough to *pull a field out*:
+`.a.b`, `.items[0].name`, leading `.` optional. A missing path, a non-scalar
+(object/array) result, or an unreadable/…invalid file all resolve to empty, so the
+segment simply collapses. Only the first line of a plain file is used (a status
+line is one line).
+
+**The path is an expression, not just a literal** — concatenate variables into it
+with `+` to read a file whose name depends on the session. This is how you read a
+per-session file (a common pattern: another tool writes `~/dir/<session-id>.json`,
+your status line reads it back):
+
+```sh
+sl --format "cyan(dir)(  green(json('~/mytool/' + session_id + '.json', '.status')))"
+```
+
+If an interpolated variable is empty the path collapses to nothing and the file is
+never read, so the segment disappears — e.g. in a session your tool hasn't written
+a file for.
+
+### Reusable — a variables config file
+
+For named variables you use across templates, list them once in a JSON config at
+`$SL_VARS` (or `~/.config/statusline-rs.vars.json`). Each becomes a normal
+template variable that gates and styles like the built-ins:
+
+```jsonc
+{
+  "vars": [
+    { "name": "note",   "file": "~/.claude/sl-note.txt" },                      // plain file
+    { "name": "ci",     "file": "~/.claude/ctx.json", "path": ".ci.status" },   // jq-from-JSON
+    { "name": "ticket", "env": "JIRA_TICKET", "max": 12 },                      // env var, clipped to 12 chars
+    { "name": "state",  "file": "~/mytool/${session_id}.json", "path": ".status", // per-session file
+      "map": { "done": "✓", "failed": "✗" }, "default": "●" }                   // rewrite value -> symbol
+  ]
+}
+```
+
+Then reference them by name:
+
+```sh
+sl --format "cyan(dir)(  dim('note:')+note)(  magenta(ci))(  blue(ticket))(  state)"
+```
+
+Each entry needs a `name` (a valid identifier) and one source:
+
+- **`file`** — the file's contents, optionally with **`path`** for jq-from-JSON
+  extraction. The path may interpolate built-in variables as **`${name}`** (e.g.
+  `~/mytool/${session_id}.json`), so a config variable can be keyed by the session.
+- **`env`** — an environment variable.
+
+Optional per-entry modifiers: **`max`** clips the value with an ellipsis, and
+**`map`** (with an optional **`default`**) rewrites a non-empty value through a
+lookup table — a conditional-free way to turn e.g. a status string into a symbol.
+A source that's missing or empty leaves the variable undefined, so its segment
+collapses — and a config name can never shadow a built-in variable.
+
+### Getting a string *from Claude* onto the status line
+
+There's no direct channel, but the file is the bridge — anything that can write a
+file can drive the status line:
+
+- **Ask the assistant.** "Set my status-line note to `deploying`" → Claude writes
+  `~/.claude/sl-note.txt`; your `file('~/.claude/sl-note.txt')` (or `note` config
+  var) shows it on the next refresh.
+- **A hook.** A `Stop` / `PostToolUse` hook can write the file
+  (`echo "$something" > ~/.claude/sl-note.txt`) — the documented, idiomatic way to
+  feed a status line.
+- **Any external process.** A watcher, a CI script, a cron job — same file, same result.
+
+`sl` re-runs after each assistant message (debounced ~300ms). If a file is written
+while the session is **idle** (e.g. by a background job), add a refresh timer so the
+change still shows:
+
+```json
+{ "statusLine": { "type": "command", "command": "sl", "refreshInterval": 5 } }
+```
 
 ## License
 
