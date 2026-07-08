@@ -287,6 +287,34 @@ fn insert_git_vars(v: &mut std::collections::BTreeMap<String, String>, cwd: &str
     }
 }
 
+/// Build the `${field}` interpolation source for external-variable `file`
+/// paths: the raw payload's top-level scalar fields (so `${version}`,
+/// `${session_id}` resolve straight from the payload — even fields not exposed
+/// as template variables) overlaid with the derived variable map (so `${dir}`,
+/// `${branch}`, and the derived `${model}` resolve too). On a key present in
+/// both, the derived value wins — they agree on shared keys like `session_id`.
+fn interp_map(
+    json: &serde_json::Value,
+    vars: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut m: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(obj) = json.as_object() {
+        for (k, val) in obj {
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue, // objects/arrays/null aren't path-substitutable
+            };
+            m.insert(k.clone(), s);
+        }
+    }
+    for (k, v) in vars {
+        m.insert(k.clone(), v.clone());
+    }
+    m
+}
+
 /// Resolve the template string per precedence (first non-empty wins):
 /// `--format <STR>` arg > `--preset <NAME>` arg > `$SL_FORMAT` > config file
 /// (`$SL_CONFIG` path if set, else `~/.config/statusline-rs.tmpl`, trailing
@@ -391,6 +419,14 @@ fn main() {
     // Registry of known variable names, shared by the reference scan and render.
     let mut registry = vars::registry();
 
+    // External (file-backed) custom variables. Parse the specs and union their
+    // names into the registry BEFORE the reference scan, so the template treats
+    // them as variables (substitute + gate their group). Resolution stays lazy —
+    // deferred to the specs the template actually references (below). A stray
+    // config can never shadow a core variable (register warns and skips).
+    let ext_specs = extvars::load_specs(&home);
+    extvars::register(&ext_specs, &mut registry, vars::VAR_NAMES);
+
     // Referenced vars drive the git-scan decision. On a parse error, fall back to
     // the known-good DEFAULT's references (and, below, to rendering DEFAULT).
     let refs = format::referenced_vars(&tmpl, &registry)
@@ -406,13 +442,16 @@ fn main() {
 
     let mut vars_map: std::collections::HashMap<String, String> = varmap.into_iter().collect();
 
-    // External (file-backed) custom variables: merged after the built-ins so a
-    // stray config can never shadow a core variable. Each becomes a normal
-    // template variable, gating and styling exactly like the built-ins. `load`
-    // reads the built-in vars for `${name}` path interpolation (e.g. keying a
-    // file by session_id).
-    let ext = extvars::load(&home, &vars_map);
-    extvars::merge(ext, &mut registry, &mut vars_map, vars::VAR_NAMES);
+    // Resolve the referenced external variables right after the git step (the
+    // same gating pattern as the repo scan): a file is read only when its
+    // variable is referenced, and once per invocation. `${field}` in a `file`
+    // path interpolates from the raw payload's top-level fields overlaid with the
+    // derived var map, so `${version}`, `${session_id}`, `${dir}` all work.
+    if !ext_specs.is_empty() {
+        let interp = interp_map(&json, &vars_map);
+        extvars::resolve_into(&ext_specs, &refs, &home, &interp, &mut vars_map, vars::VAR_NAMES);
+    }
+
     let out = match format::render_home(&tmpl, &vars_map, &registry, &home) {
         Ok(s) => s,
         Err(_) => format::render_home(vars::DEFAULT, &vars_map, &registry, &home).unwrap_or_default(),
@@ -484,5 +523,25 @@ mod tests {
     fn meter_sgr_selects_mode() {
         assert_eq!(meter_sgr(0.0, "91", false), "91"); // fallback: discrete band
         assert_eq!(meter_sgr(0.0, "91", true), "38;2;215;0;0"); // truecolor: ramp
+    }
+
+    #[test]
+    fn interp_map_unions_payload_and_vars() {
+        // Top-level payload scalars (including `version`, which is NOT a template
+        // variable) are interpolation keys; nested objects are skipped. The
+        // derived var map overlays, so `dir` (derived) wins over any payload key.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"version":"1.2.3","session_id":"abc","model":{"id":"x"},"count":7}"#,
+        )
+        .unwrap();
+        let vars: std::collections::HashMap<String, String> =
+            [("dir".to_string(), "acme".to_string()), ("session_id".to_string(), "abc".to_string())]
+                .into_iter()
+                .collect();
+        let m = interp_map(&json, &vars);
+        assert_eq!(m.get("version"), Some(&"1.2.3".to_string())); // payload-only field
+        assert_eq!(m.get("count"), Some(&"7".to_string())); // number stringified
+        assert_eq!(m.get("dir"), Some(&"acme".to_string())); // derived var
+        assert_eq!(m.get("model"), None); // nested object: not substitutable
     }
 }
